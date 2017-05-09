@@ -1,0 +1,177 @@
+Description: Create an AMI from an EC2 instance.
+Parameters:
+  ImageId:
+    Description: Image ID for base EC2 instance.
+    Type: AWS::EC2::Image::Id
+    # Deep Learning AMI AmazonLinux - 2.0
+    Default: ami-e7c96af1
+  
+  InstanceType:
+    Description: Instance type to launch EC2 instances.
+    Type: String
+    Default: p2.xlarge
+    AllowedValues: [ p2.xlarge, g2.2xlarge  ]
+
+  PublicSubnet:
+    Type: "AWS::EC2::Subnet::Id"
+    Description: The public subnet to launch the instance.
+
+Resources:
+  # Completes when the instance is fully provisioned and ready for AMI creation.
+  AMICreate:
+    Type: AWS::CloudFormation::WaitCondition
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          SubnetId: 
+            Ref: "PublicSubnet"
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash -x
+          rc=0
+          yum -y install docker || rc=1
+          echo 'DOCKER_STORAGE_OPTIONS="--storage-driver overlay --storage-opt dm.fs=ext4"' | tee /etc/sysconfig/docker-storage || rc=1
+          service docker start || rc=1
+          wget -P /tmp https://github.com/NVIDIA/nvidia-docker/releases/download/v1.0.1/nvidia-docker_1.0.1_amd64.tar.xz || rc=1
+          tar --strip-components=1 -C /usr/bin -xvf /tmp/nvidia-docker*.tar.xz || rc=1
+          echo '#!/bin/bash' | tee /var/lib/cloud/scripts/per-boot/00_nvidia-modprobe >/dev/null || rc=1
+          echo 'nvidia-modprobe -u -c=0' | tee --append /var/lib/cloud/scripts/per-boot/00_nvidia-modprobe >/dev/null || rc=1
+          chmod +x /var/lib/cloud/scripts/per-boot/00_nvidia-modprobe || rc=1
+          /var/lib/cloud/scripts/per-boot/00_nvidia-modprobe || rc=1
+          nohup nvidia-docker-plugin & 2>&1 | tee /tmp/nvidia-docker.log || rc=1
+          nvidia-smi -q > /tmp/nvidia-smi.log || rc=1
+          docker pull nvidia/cuda:6.5-runtime || rc=1
+          docker pull mxnet/python:gpu || rc=1
+          nvidia-docker run --rm nvidia/cuda:6.5-runtime nvidia-smi || true
+          sleep 15 # Fails first time!
+          nvidia-docker run --rm nvidia/cuda:6.5-runtime nvidia-smi || rc=1
+          nvidia_base=/var/lib/nvidia-docker/volumes/nvidia_driver || rc=1
+          ln -s $nvidia_base/$(ls $nvidia_base | sort -n  | tail -1) $nvidia_base/latest || rc=1
+          yum -y install ecs-init || rc=1
+          /opt/aws/bin/cfn-signal \
+            -e $rc \
+            --stack ${AWS::StackName} \
+            --region ${AWS::Region} \
+            --resource AMICreate
+          shutdown -h now
+  AMI:
+    Type: Custom::AMI
+    DependsOn: AMICreate
+    Properties:
+      ServiceToken: !GetAtt AMIFunction.Arn
+      InstanceId: !Ref Instance
+  AMIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          var response = require('cfn-response');
+          var AWS = require('aws-sdk');
+          exports.handler = function(event, context) {
+            console.log("Request received:\n", JSON.stringify(event));
+            var physicalId = event.PhysicalResourceId;
+            function success(data) {
+              return response.send(event, context, response.SUCCESS, data, physicalId);
+            }
+            function failed(e) {
+              return response.send(event, context, response.FAILED, e, physicalId);
+            }
+            // Call ec2.waitFor, continuing if not finished before Lambda function timeout.
+            function wait(waiter) {
+              console.log("Waiting: ", JSON.stringify(waiter));
+              event.waiter = waiter;
+              event.PhysicalResourceId = physicalId;
+              var request = ec2.waitFor(waiter.state, waiter.params);
+              setTimeout(()=>{
+                request.abort();
+                console.log("Timeout reached, continuing function. Params:\n", JSON.stringify(event));
+                var lambda = new AWS.Lambda();
+                lambda.invoke({
+                  FunctionName: context.invokedFunctionArn,
+                  InvocationType: 'Event',
+                  Payload: JSON.stringify(event)
+                }).promise().then((data)=>context.done()).catch((err)=>context.fail(err));
+              }, context.getRemainingTimeInMillis() - 5000);
+              return request.promise().catch((err)=>
+                (err.code == 'RequestAbortedError') ?
+                  new Promise(()=>context.done()) :
+                  Promise.reject(err)
+              );
+            }
+            var ec2 = new AWS.EC2(),
+                instanceId = event.ResourceProperties.InstanceId;
+            if (event.waiter) {
+              wait(event.waiter).then((data)=>success({})).catch((err)=>failed(err));
+            } else if (event.RequestType == 'Create' || event.RequestType == 'Update') {
+              if (!instanceId) { failed('InstanceID required'); }
+              ec2.waitFor('instanceStopped', {InstanceIds: [instanceId]}).promise()
+              .then((data)=>
+                ec2.createImage({
+                  InstanceId: instanceId,
+                  Name: event.RequestId
+                }).promise()
+              ).then((data)=>
+                wait({
+                  state: 'imageAvailable',
+                  params: {ImageIds: [physicalId = data.ImageId]}
+                })
+              ).then((data)=>success({})).catch((err)=>failed(err));
+            } else if (event.RequestType == 'Delete') {
+              if (physicalId.indexOf('ami-') !== 0) { return success({});}
+              ec2.describeImages({ImageIds: [physicalId]}).promise()
+              .then((data)=>
+                (data.Images.length == 0) ? success({}) :
+                ec2.deregisterImage({ImageId: physicalId}).promise()
+              ).then((data)=>
+                ec2.describeSnapshots({Filters: [{
+                  Name: 'description',
+                  Values: ["*" + physicalId + "*"]
+                }]}).promise()
+              ).then((data)=>
+                (data.Snapshots.length === 0) ? success({}) :
+                ec2.deleteSnapshot({SnapshotId: data.Snapshots[0].SnapshotId}).promise()
+              ).then((data)=>success({})).catch((err)=>failed(err));
+            }
+          };
+      Runtime: nodejs4.3
+      Timeout: 300
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: {Service: [lambda.amazonaws.com]}
+          Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+      - PolicyName: EC2Policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+              - 'ec2:DescribeInstances'
+              - 'ec2:DescribeImages'
+              - 'ec2:CreateImage'
+              - 'ec2:DeregisterImage'
+              - 'ec2:DescribeSnapshots'
+              - 'ec2:DeleteSnapshot'
+              Resource: ['*']
+Outputs:
+  AMI:
+    Value: !Ref AMI
