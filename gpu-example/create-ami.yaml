@@ -143,7 +143,7 @@ Resources:
               ).then((data)=>success({})).catch((err)=>failed(err));
             }
           };
-      Runtime: nodejs4.3
+      Runtime: nodejs10.x
       Timeout: 300
   LambdaExecutionRole:
     Type: AWS::IAM::Role
